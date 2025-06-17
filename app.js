@@ -6,277 +6,310 @@ const axios = require('axios');
 const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
 
-// ========== [Global Config] ==========
-const CONFIG = {
-  PORT: process.env.PORT || 8080,
-  UUID: (process.env.UUID || 'a378c13e-27f0-44e0-afa9-138a55208041').replace(/-/g, ""),
-  ZERO_AUTH: process.env.ZERO_AUTH || 'eyJhIjoiZmM5YWQ3MmI4ZTYyZGZkMzMxZTk1MjY3MjA1YjhmZGUiLCJ0IjoiMmRiNGIzZTAtZDRjMy00ZDQwLWI2ZTktOGJiNjJhMmRkOTYyIiwicyI6IllURTNNMkZqTkdVdE1EQTVaUzAwTXpjMExUazVaamN0Tm1VMU9UQTNOalk1TURG',
-  KEEP_ALIVE_INTERVAL: 240000, // 4 دقائق
-  PING_TIMEOUT: 5000 // 5 ثواني
+// تحسين نظام التسجيل (Logging)
+const logger = {
+    log: (...args) => {
+        const timestamp = new Date().toISOString();
+        console.log(`[${timestamp}]`, ...args);
+    },
+    error: (...args) => {
+        const timestamp = new Date().toISOString();
+        console.error(`[${timestamp}] ERROR:`, ...args);
+    }
 };
 
-// ========== [Logger Functions] ==========
-function log(...args) {
-  console.log(`[${new Date().toISOString()}]`, ...args);
-}
+// إعدادات التكوين
+const uuid = (process.env.UUID || 'a378c13e-27f0-44e0-afa9-138a55208041').replace(/-/g, "");
+const port = process.env.PORT || 8080;
+const zerothrust_auth = process.env.ZERO_AUTH || 'eyJhIjoiZmM5YWQ3MmI4ZTYyZGZkMzMxZTk1MjY3MjA1YjhmZGUiLCJ0IjoiMmRiNGIzZTAtZDRjMy00ZDQwLWI2ZTktOGJiNjJhMmRkOTYyIiwicyI6IllURTNNMkZqTkdVdE1EQTVaUzAwTXpjMExUazVaamN0Tm1VMU9UQTNOalk1TURG';
+const MAX_RETRIES = 5;
+const RETRY_DELAY = 5000; // 5 ثواني
 
-function error(...args) {
-  console.error(`[${new Date().toISOString()}]`, ...args);
-}
-
-// ========== [Server Utilities] ==========
-async function setupServerBinary() {
-  try {
-    log('Setting up server binaries...');
-    await Promise.all([
-      exec('chmod +x server'),
-      exec(`nohup ./server tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${CONFIG.ZERO_AUTH} >/dev/null 2>&1 &`)
-    ]);
-    log('Server binaries setup completed');
-  } catch (err) {
-    error('Failed to setup server binaries:', err);
-    throw err;
-  }
-}
-
-async function checkPortAvailability(port) {
-  return new Promise((resolve) => {
-    const tester = net.createServer()
-      .once('error', () => resolve(false))
-      .once('listening', () => {
-        tester.once('close', () => resolve(true)).close();
-      })
-      .listen(port);
-  });
-}
-
-// ========== [Keep-Alive Mechanism] ==========
-function startKeepAlive(port) {
-  const pingServer = async () => {
-    try {
-      const response = await axios.get(`http://localhost:${port}/ping`, {
-        timeout: CONFIG.PING_TIMEOUT
-      });
-      log(`Keep-Alive Ping Successful (Status: ${response.data.status})`);
-    } catch (err) {
-      error('Keep-Alive Ping Failed:', err.message);
+class ServerManager {
+    constructor() {
+        this.server = null;
+        this.wss = null;
+        this.activeConnections = new Set();
+        this.retryCount = 0;
     }
-  };
 
-  // Ping immediately on startup
-  pingServer();
-  
-  // Set up periodic pinging
-  const intervalId = setInterval(pingServer, CONFIG.KEEP_ALIVE_INTERVAL);
-  
-  return intervalId;
-}
-
-// ========== [WebSocket Handler] ==========
-function handleWebSocketConnection(ws) {
-  log('New WebSocket connection');
-  
-  const connectionInfo = {
-    id: Math.random().toString(36).substring(7),
-    startTime: Date.now()
-  };
-
-  ws.on('message', async (msg) => {
-    try {
-      // Handle VLESS protocol messages here
-      // ... (الكود الأصلي لمعالجة رسائل VLESS)
-    } catch (err) {
-      error('WebSocket message error:', err);
-      ws.close();
-    }
-  });
-
-  ws.on('close', () => {
-    log(`Connection ${connectionInfo.id} closed after ${(Date.now() - connectionInfo.startTime)/1000}s`);
-  });
-
-  ws.on('error', (err) => {
-    error('WebSocket error:', err);
-  });
-}
-
-// ========== [HTTP Server] ==========
-function createHttpServer() {
-  const server = http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      
-      // Route Handling
-      if (req.method === 'GET') {
-        switch (url.pathname) {
-          case '/':
-            return serveHomePage(res);
-          case '/ping':
-            return servePingResponse(res);
-          case '/status':
-            return await serveStatusPage(res);
-          case '/config':
-            return serveVlessConfig(req, res);
-          default:
-            return serveNotFound(res);
+    async start() {
+        try {
+            await this.setupServer();
+            await this.startHttpServer();
+            logger.log('Server started successfully');
+            this.retryCount = 0; // إعادة تعيين عداد المحاولات بعد نجاح التشغيل
+        } catch (error) {
+            logger.error('Failed to start server:', error);
+            
+            if (this.retryCount < MAX_RETRIES) {
+                this.retryCount++;
+                logger.log(`Retrying (${this.retryCount}/${MAX_RETRIES}) in ${RETRY_DELAY/1000} seconds...`);
+                setTimeout(() => this.start(), RETRY_DELAY);
+            } else {
+                logger.error('Max retries reached. Exiting...');
+                process.exit(1);
+            }
         }
-      } else {
-        return serveNotFound(res);
-      }
-    } catch (err) {
-      error('HTTP request error:', err);
-      serveServerError(res);
     }
-  });
 
-  // WebSocket Upgrade Handler
-  const wss = new WebSocket.Server({ noServer: true });
-  wss.on('connection', handleWebSocketConnection);
-
-  server.on('upgrade', (req, socket, head) => {
-    try {
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit('connection', ws, req);
-      });
-    } catch (err) {
-      error('WebSocket upgrade error:', err);
-      socket.destroy();
+    async setupServer() {
+        try {
+            await Promise.all([
+                exec(`chmod +x server`),
+                exec(`nohup ./server tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${zerothrust_auth} >/dev/null 2>&1 &`)
+            ]);
+            logger.log('Server setup completed successfully');
+        } catch (error) {
+            logger.error('Error during server setup:', error);
+            throw error;
+        }
     }
-  });
 
-  return server;
-}
+    async startHttpServer() {
+        return new Promise((resolve, reject) => {
+            // إنشاء خادم HTTP
+            this.server = http.createServer(async (req, res) => {
+                const url = new URL(req.url, `http://${req.headers.host}`);
 
-// ========== [HTTP Route Handlers] ==========
-function serveHomePage(res) {
-  res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(`
+                if (req.method === 'GET' && url.pathname === '/') {
+                    res.writeHead(200, { 'Content-Type': 'text/html' });
+                    res.end(`
 <!DOCTYPE html>
 <html>
 <head>
-  <title>VLESS Server</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 2rem; line-height: 1.6 }
-    .container { max-width: 800px; margin: 0 auto }
-    .status { padding: 1rem; background: #f5f5f5; border-radius: 5px }
-  </style>
+    <meta charset="UTF-8">
+    <title>HELLO WORLD</title>
 </head>
 <body>
-  <div class="container">
-    <h1>VLESS Proxy Server</h1>
-    <div class="status">
-      <p>Server is running with Keep-Alive mechanism</p>
-      <p>UUID: ${CONFIG.UUID}</p>
-      <p>Port: ${CONFIG.PORT}</p>
-      <p><a href="/ping">Check server status</a></p>
-      <p><a href="/config">Show VLESS config</a></p>
-    </div>
-  </div>
+    <h1>HELLO WORLD</h1>
+    <p>Server uptime: ${process.uptime()} seconds</p>
+    <p>Active connections: ${this.activeConnections.size}</p>
 </body>
 </html>
-  `);
-}
+                    `);
+                } else if (req.method === 'GET' && url.searchParams.get('check') === 'VLESS__CONFIG') {
+                    const hostname = req.headers.host.split(':')[0];
+                    const vlessConfig = {
+                        uuid: uuid,
+                        port: port,
+                        host: hostname,
+                        vless_uri: `vless://${uuid}@${hostname}:443?security=tls&fp=randomized&type=ws&${hostname}&encryption=none`
+                    };
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify(vlessConfig));
+                } else if (req.method === 'GET' && url.pathname === '/status') {
+                    try {
+                        const [externalStatus, localStatus] = await Promise.all([
+                            axios.get('https://example.com/api/status').catch(() => ({ data: 'external check failed' })),
+                            checkLocalServiceStatus()
+                        ]);
+                        
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({
+                            external: externalStatus.data,
+                            local: localStatus,
+                            server: 'running',
+                            uptime: process.uptime(),
+                            connections: this.activeConnections.size
+                        }));
+                    } catch (error) {
+                        res.writeHead(500, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: 'Status check failed' }));
+                    }
+                } else {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' });
+                    res.end('Not Found');
+                }
+            });
 
-function servePingResponse(res) {
-  res.writeHead(200, { 
-    'Content-Type': 'application/json',
-    'Cache-Control': 'no-store'
-  });
-  res.end(JSON.stringify({
-    status: 'alive',
-    timestamp: Date.now(),
-    uptime: process.uptime()
-  }));
-}
+            // إعداد خادم WebSocket
+            this.wss = new WebSocket.Server({ noServer: true });
 
-async function serveStatusPage(res) {
-  try {
-    const [portAvailable, externalStatus] = await Promise.all([
-      checkPortAvailability(CONFIG.PORT),
-      axios.get('https://httpbin.org/get').catch(() => ({ data: 'external_check_failed' }))
-    ]);
-    
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      server: {
-        status: 'running',
-        port: CONFIG.PORT,
-        port_available: portAvailable,
-        uptime: process.uptime()
-      },
-      external_status: externalStatus.data
-    }));
-  } catch (err) {
-    error('Status check error:', err);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Status check failed' }));
-  }
-}
+            this.server.on('upgrade', (request, socket, head) => {
+                // إضافة مهلة للاتصال لمنع التوقف
+                socket.setTimeout(30000, () => {
+                    logger.log('Connection timeout, closing socket');
+                    socket.destroy();
+                });
 
-function serveVlessConfig(req, res) {
-  const hostname = req.headers.host.split(':')[0];
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    uuid: CONFIG.UUID,
-    port: CONFIG.PORT,
-    host: hostname,
-    vless_uri: `vless://${CONFIG.UUID}@${hostname}:443?security=tls&fp=randomized&type=ws&${hostname}&encryption=none`
-  }));
-}
+                this.wss.handleUpgrade(request, socket, head, ws => {
+                    this.wss.emit('connection', ws, request);
+                });
+            });
 
-function serveNotFound(res) {
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Not Found');
-}
+            this.wss.on('connection', ws => {
+                logger.log("New WebSocket connection");
+                this.activeConnections.add(ws);
+                
+                ws.on('close', () => {
+                    this.activeConnections.delete(ws);
+                    logger.log(`Connection closed. Active connections: ${this.activeConnections.size}`);
+                });
 
-function serveServerError(res) {
-  res.writeHead(500, { 'Content-Type': 'text/plain' });
-  res.end('Internal Server Error');
-}
+                ws.once('message', async msg => {
+                    try {
+                        const [VERSION] = msg;
+                        const id = msg.slice(1, 17);
 
-// ========== [Main Server Startup] ==========
-async function startServer() {
-  try {
-    // Verify port availability
-    const portAvailable = await checkPortAvailability(CONFIG.PORT);
-    if (!portAvailable) {
-      throw new Error(`Port ${CONFIG.PORT} is already in use`);
+                        if (!id.every((v, i) => v === parseInt(uuid.substr(i * 2, 2), 16))) {
+                            logger.log("UUID mismatch. Connection rejected.");
+                            ws.close();
+                            return;
+                        }
+
+                        let i = msg.slice(17, 18).readUInt8() + 19;
+                        const port = msg.slice(i, i += 2).readUInt16BE(0);
+                        const ATYP = msg.slice(i, i += 1).readUInt8();
+
+                        let host;
+                        if (ATYP === 1) {
+                            host = msg.slice(i, i += 4).join('.');
+                        } else if (ATYP === 2) {
+                            host = new TextDecoder().decode(msg.slice(i + 1, i += 1 + msg.slice(i, i + 1).readUInt8()));
+                        } else if (ATYP === 3) {
+                            host = msg.slice(i, i += 16).reduce((s, b, idx, arr) => 
+                                (idx % 2 ? s.concat(arr.slice(idx - 1, idx + 1)) : s), [])
+                                .map(b => b.readUInt16BE(0).toString(16))
+                                .join(':');
+                        } else {
+                            logger.log("Unsupported ATYP:", ATYP);
+                            ws.close();
+                            return;
+                        }
+
+                        logger.log('New connection to:', host, port);
+                        ws.send(new Uint8Array([VERSION, 0]));
+
+                        const duplex = createWebSocketStream(ws);
+                        const socket = net.connect({ host, port }, () => {
+                            socket.write(msg.slice(i));
+                            duplex.on('error', err => logger.error('Duplex error:', err))
+                                .pipe(socket)
+                                .on('error', err => logger.error('Socket error:', err))
+                                .pipe(duplex);
+                        });
+
+                        socket.on('error', err => logger.error('Connection error:', { host, port, error: err }));
+                    } catch (error) {
+                        logger.error('Error handling WebSocket message:', error);
+                        ws.close();
+                    }
+                }).on('error', err => logger.error('WebSocket Error:', err));
+            });
+
+            // بدء الخادم
+            this.server.listen(port, () => {
+                logger.log(`Server listening on port: ${port}`);
+                logger.log(`VLESS Proxy UUID: ${uuid}`);
+                logger.log(`Access home page at: http://localhost:${port}`);
+                resolve();
+            });
+
+            this.server.on('error', err => {
+                logger.error('Server Error:', err);
+                reject(err);
+            });
+        });
     }
 
-    // Setup server binary
-    await setupServerBinary();
-
-    // Create HTTP server
-    const server = createHttpServer();
-
-    // Start listening
-    server.listen(CONFIG.PORT, '0.0.0.0', () => {
-      log(`Server started on port ${CONFIG.PORT}`);
-      log(`Web interface available at: http://localhost:${CONFIG.PORT}`);
-      
-      // Start keep-alive mechanism
-      const keepAliveInterval = startKeepAlive(CONFIG.PORT);
-      
-      // Cleanup on exit
-      process.on('SIGINT', () => {
-        log('Shutting down server...');
-        clearInterval(keepAliveInterval);
-        server.close(() => {
-          process.exit(0);
+    async shutdown() {
+        logger.log('Shutting down server...');
+        
+        // إغلاق جميع الاتصالات النشطة
+        this.activeConnections.forEach(ws => {
+            try {
+                ws.close();
+            } catch (err) {
+                logger.error('Error closing connection:', err);
+            }
         });
-      });
-    });
 
-    server.on('error', (err) => {
-      error('Server error:', err);
-      process.exit(1);
-    });
+        // إغلاق خادم WebSocket
+        if (this.wss) {
+            await new Promise(resolve => {
+                this.wss.close(err => {
+                    if (err) logger.error('Error closing WebSocket server:', err);
+                    resolve();
+                });
+            });
+        }
 
-  } catch (err) {
-    error('Failed to start server:', err);
-    process.exit(1);
-  }
+        // إغلاق خادم HTTP
+        if (this.server) {
+            await new Promise(resolve => {
+                this.server.close(err => {
+                    if (err) logger.error('Error closing HTTP server:', err);
+                    resolve();
+                });
+            });
+        }
+
+        logger.log('Server shutdown complete');
+    }
 }
 
-// ========== [Start the Server] ==========
-startServer();
+// دالة مساعدة للتحقق من حالة الخدمة المحلية
+async function checkLocalServiceStatus() {
+    try {
+        const checks = await Promise.all([
+            checkPortAvailability(port),
+        ]);
+        
+        return {
+            status: 'healthy',
+            details: checks
+        };
+    } catch (error) {
+        return {
+            status: 'unhealthy',
+            error: error.message
+        };
+    }
+}
+
+// دالة مساعدة للتحقق من توفر المنفذ
+function checkPortAvailability(port) {
+    return new Promise((resolve, reject) => {
+        const tester = net.createServer()
+            .once('error', err => {
+                if (err.code === 'EADDRINUSE') {
+                    resolve({ port, available: false });
+                } else {
+                    reject(err);
+                }
+            })
+            .once('listening', () => {
+                tester.once('close', () => {
+                    resolve({ port, available: true });
+                }).close();
+            })
+            .listen(port);
+    });
+}
+
+// معالجة إشارات الإغلاق
+process.on('SIGINT', () => {
+    logger.log('Received SIGINT signal');
+    serverManager.shutdown().then(() => process.exit(0));
+});
+
+process.on('SIGTERM', () => {
+    logger.log('Received SIGTERM signal');
+    serverManager.shutdown().then(() => process.exit(0));
+});
+
+process.on('uncaughtException', err => {
+    logger.error('Uncaught Exception:', err);
+    serverManager.shutdown()
+        .then(() => process.exit(1))
+        .catch(() => process.exit(1));
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// بدء تشغيل الخادم
+const serverManager = new ServerManager();
+serverManager.start();
