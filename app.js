@@ -50,7 +50,7 @@ async function startServer() {
 </head>
 <body>
     <h1>HELLO WORLD</h1>
-    <p>Server is running with Keep-Alive!</p>
+    <p></p>
 </body>
 </html>
             `);
