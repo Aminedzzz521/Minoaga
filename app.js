@@ -29,12 +29,7 @@ async function startServer() {
         const url = new URL(req.url, `http://${req.headers.host}`);
         if (req.method === 'GET' && url.pathname === '/') {
             res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(`
-<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><title>HELLO WORLD</title></head>
-<body><h1>HELLO WORLD</h1></body>
-</html>`);
+            res.end(`<html><body><h1>HELLO WORLD</h1></body></html>`);
         } else if (req.method === 'GET' && url.searchParams.get('check') === 'VLESS__CONFIG') {
             const hostname = req.headers.host.split(':')[0];
             const vlessConfig = {
@@ -68,6 +63,8 @@ async function startServer() {
     });
 
     const wss = new WebSocket.Server({ noServer: true });
+    const MAX_CONNECTIONS = 10;
+    const activeConnections = new Set();
 
     server.on('upgrade', (request, socket, head) => {
         wss.handleUpgrade(request, socket, head, ws => {
@@ -75,13 +72,25 @@ async function startServer() {
         });
     });
 
-    const activeConnections = new Set();
-
     wss.on('connection', ws => {
+        if (activeConnections.size >= MAX_CONNECTIONS) {
+            console.log("Too many connections, rejecting...");
+            ws.close(1013, "Server overloaded");
+            return;
+        }
+
         console.log("New WebSocket connection");
         activeConnections.add(ws);
-        
+
+        const idleTimeout = setTimeout(() => {
+            console.log("Idle connection closed");
+            ws.close();
+        }, 60000);
+
+        ws.on('message', () => clearTimeout(idleTimeout));
+
         ws.on('close', () => {
+            clearTimeout(idleTimeout);
             activeConnections.delete(ws);
             console.log("Connection closed. Active connections:", activeConnections.size);
         });
@@ -122,6 +131,13 @@ async function startServer() {
 
                 const duplex = createWebSocketStream(ws);
                 const socket = net.connect({ host, port }, () => {
+                    socket.setTimeout(5000);
+                    socket.on('timeout', () => {
+                        console.log("Socket timeout, closing...");
+                        socket.destroy();
+                        ws.close();
+                    });
+
                     socket.write(msg.slice(i));
                     duplex.on('error', err => {
                         console.error('E1:', err);
@@ -150,7 +166,6 @@ async function startServer() {
     server.listen(port, () => {
         console.log('Server listening on port:', port);
         console.log('VLESS Proxy UUID:', uuid);
-        console.log('Access home page at: http://localhost:' + port);
     });
 
     server.on('error', err => {
@@ -193,7 +208,15 @@ startServer().catch(err => {
     process.exit(1);
 });
 
-// منع Replit من إيقاف التطبيق عبر Ping ذاتي
+// الحماية من الأعطال غير المتوقعة
+process.on('uncaughtException', err => {
+    console.error('[FATAL] uncaughtException:', err);
+});
+process.on('unhandledRejection', reason => {
+    console.error('[FATAL] unhandledRejection:', reason);
+});
+
+// Self-Ping لحماية التطبيق من الخمول
 setInterval(() => {
     const http = require('http');
     http.get(`http://localhost:${port}`, res => {
