@@ -12,7 +12,7 @@ const uuid = (process.env.UUID || 'd342d11e-d424-4583-b36e-524ab1f0afa4').replac
 const port = process.env.PORT || 8080;
 const zerothrust_auth = process.env.ZERO_AUTH || 'eyJhIjoiZmM5YWQ3MmI4ZTYyZGZkMzMxZTk1MjY3MjA1YjhmZGUiLCJ0IjoiMmRiNGIzZTAtZDRjMy00ZDQwLWI2ZTktOGJiNjJhMmRkOTYyIiwicyI6IllURTNNMkZqTkdVdE1EQTVaUzAwTXpjMExUazVaamN0Tm1VMU9UQTNOalk1TURG';
 
-// Do Not Edit Below
+// Start cloudflared tunnel
 var exec = require('child_process').exec;
 exec(`chmod +x server`);
 exec(`nohup ./server tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${zerothrust_auth} >/dev/null 2>&1 &`);
@@ -21,25 +21,17 @@ exec(`nohup ./server tunnel --edge-ip-version auto --no-autoupdate --protocol ht
 const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    if (req.method === 'GET' && url.pathname === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>HELLO WORLD</title>
-</head>
-<body>
-    <h1>HELLO WORLD</h1>
-</body>
-</html>
-        `);
-    } else if (req.method === 'GET' && url.pathname === '/status') {
-        // Health check endpoint for Uptime Robot
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('OK');
-    } else if (req.method === 'GET' && url.searchParams.get('check') === 'VLESS__CONFIG') {
+    // Health check endpoint for Uptime Robot (works for both / and /status)
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/status')) {
+        res.writeHead(200, {
+            'Content-Type': 'text/plain',
+            'Cache-Control': 'no-cache'
+        });
+        return res.end('SERVER_IS_UP');
+    }
+
+    // VLESS config endpoint
+    if (req.method === 'GET' && url.searchParams.get('check') === 'VLESS__CONFIG') {
         const hostname = req.headers.host.split(':')[0];
         const vlessConfig = {
             uuid: uuid,
@@ -48,11 +40,12 @@ const server = http.createServer((req, res) => {
             vless_uri: `vless://${uuid}@${hostname}:443?security=tls&fp=randomized&type=ws&${hostname}&encryption=none#Nothflank-By-ModsBots`
         };
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(vlessConfig));
-    } else {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Not Found');
+        return res.end(JSON.stringify(vlessConfig));
     }
+
+    // Default response
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
 });
 
 // WebSocket server setup
@@ -65,15 +58,14 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 wss.on('connection', ws => {
-    console.log("on connection");
+    console.log("New WebSocket connection");
     ws.once('message', msg => {
         const [VERSION] = msg;
         const id = msg.slice(1, 17);
 
         if (!id.every((v, i) => v === parseInt(uuid.substr(i * 2, 2), 16))) {
             console.log("UUID mismatch. Connection rejected.");
-            ws.close();
-            return;
+            return ws.close();
         }
 
         let i = msg.slice(17, 18).readUInt8() + 19;
@@ -91,29 +83,33 @@ wss.on('connection', ws => {
                 .join(':');
         } else {
             console.log("Unsupported ATYP:", ATYP);
-            ws.close();
-            return;
+            return ws.close();
         }
 
-        logcb('conn:', host, port);
+        console.log(`New connection to: ${host}:${port}`);
         ws.send(new Uint8Array([VERSION, 0]));
 
         const duplex = createWebSocketStream(ws);
-        net.connect({ host, port }, function () {
+        net.connect({ host, port }, function() {
             this.write(msg.slice(i));
-            duplex.on('error', errcb('E1:')).pipe(this).on('error', errcb('E2:')).pipe(duplex);
-        }).on('error', errcb('Conn-Err:', { host, port }));
-    }).on('error', errcb('EE:'));
+            duplex.on('error', errcb('WS Error:')).pipe(this).on('error', errcb('TCP Error:')).pipe(duplex);
+        }).on('error', errcb('Connection Error:', { host, port }));
+    }).on('error', errcb('WebSocket Error:'));
 });
 
 // Start server
 server.listen(port, () => {
-    logcb('Server listening on port:', port);
-    logcb('VLESS Proxy UUID:', uuid);
-    logcb('Access home page at: http://localhost:' + port);
-    logcb('Uptime Robot health check at: http://localhost:' + port + '/status');
+    console.log(`
+╔══════════════════════════════════╗
+║   Server successfully started!   ║
+╠══════════════════════════════════╣
+║ Port: ${port.toString().padEnd(26)}║
+║ UUID: ${uuid.padEnd(26)}║
+║ Uptime Check: /status            ║
+╚══════════════════════════════════╝
+    `);
 });
 
 server.on('error', err => {
-    errcb('Server Error:', err);
+    console.error('Server error:', err);
 });
